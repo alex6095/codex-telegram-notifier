@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import signal
@@ -22,6 +23,10 @@ STOP = False
 class FileState:
     offset: int = 0
     topic: str = ""
+    cwd: str = ""
+    last_plan_turn_id: str = ""
+    last_plan_reply_norm: str = ""
+    last_plan_sent_at: float = 0.0
 
 
 def _signal_handler(signum, frame):  # type: ignore[no-untyped-def]
@@ -55,16 +60,21 @@ def load_state(path: Path) -> Dict[str, FileState]:
         if isinstance(item, dict):
             offset = int(item.get("offset", 0))
             topic = str(item.get("topic", "")).strip()
+            cwd = str(item.get("cwd", "")).strip()
         else:
             offset = int(item)
             topic = ""
-        out[file_path] = FileState(offset=max(0, offset), topic=topic)
+            cwd = ""
+        out[file_path] = FileState(offset=max(0, offset), topic=topic, cwd=cwd)
     return out
 
 
 def save_state(path: Path, state: Dict[str, FileState]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {file_path: {"offset": st.offset, "topic": st.topic} for file_path, st in state.items()}
+    payload = {
+        file_path: {"offset": st.offset, "topic": st.topic, "cwd": st.cwd}
+        for file_path, st in state.items()
+    }
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
@@ -142,6 +152,35 @@ def detect_topic_from_file(file_path: Path, max_lines: int = 300) -> str:
     return ""
 
 
+def detect_cwd_from_file(file_path: Path, max_lines: int = 300) -> str:
+    try:
+        with file_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for index, line in enumerate(handle):
+                if index >= max_lines:
+                    break
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                row_type = row.get("type")
+                payload = row.get("payload", {})
+                if not isinstance(payload, dict):
+                    continue
+
+                if row_type == "turn_context":
+                    cwd = _clean_optional_text(payload.get("cwd"))
+                    if cwd:
+                        return cwd
+                if row_type == "session_meta":
+                    cwd = _clean_optional_text(payload.get("cwd"))
+                    if cwd:
+                        return cwd
+    except Exception:
+        return ""
+    return ""
+
+
 def send_notification(sender_script: Path, text: str) -> None:
     try:
         result = subprocess.run(
@@ -180,15 +219,62 @@ def _short(text: str, limit: int) -> str:
     return compact[: limit - 3] + "..."
 
 
+def _normalize_for_dedupe(text: str) -> str:
+    return " ".join(str(text).split()).strip()
+
+
+def _clean_optional_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _parse_tool_arguments(arguments: object) -> dict:
+    if isinstance(arguments, dict):
+        return arguments
+    if not isinstance(arguments, str):
+        return {}
+
+    raw = arguments.strip()
+    if not raw:
+        return {}
+
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    # Some runtimes may emit Python-literal style payloads.
+    try:
+        parsed = ast.literal_eval(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    return {}
+
+
+def _extract_message_text(content_items: object) -> str:
+    if not isinstance(content_items, list):
+        return ""
+    for item in content_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in {"output_text", "input_text"}:
+            text = _clean_optional_text(item.get("text"))
+            if text:
+                return text
+    return ""
+
+
 def build_request_user_input_text(payload: dict) -> str:
     if payload.get("type") != "function_call" or payload.get("name") != "request_user_input":
         return ""
 
-    args_raw = payload.get("arguments")
-    try:
-        args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
-    except Exception:
-        args = {}
+    args = _parse_tool_arguments(payload.get("arguments"))
 
     questions = args.get("questions")
     if not isinstance(questions, list) or not questions:
@@ -200,8 +286,8 @@ def build_request_user_input_text(payload: dict) -> str:
     for idx, q in enumerate(questions[:max_questions], 1):
         if not isinstance(q, dict):
             continue
-        header = _short(q.get("header", f"Question {idx}"), 40)
-        question = _short(q.get("question", ""), 260)
+        header = _short(_clean_optional_text(q.get("header")) or f"Question {idx}", 40)
+        question = _short(_clean_optional_text(q.get("question")), 260)
         if question:
             lines.append(f"{idx}. {header}: {question}")
         else:
@@ -213,7 +299,7 @@ def build_request_user_input_text(payload: dict) -> str:
             for opt_idx, opt in enumerate(options[:max_options], 1):
                 label = ""
                 if isinstance(opt, dict):
-                    label = _short(opt.get("label", ""), 120)
+                    label = _short(_clean_optional_text(opt.get("label")), 120)
                 if label:
                     lines.append(f"   - {opt_idx}) {label}")
             if len(options) > max_options:
@@ -229,13 +315,9 @@ def build_update_plan_text(payload: dict) -> str:
     if payload.get("type") != "function_call" or payload.get("name") != "update_plan":
         return ""
 
-    args_raw = payload.get("arguments")
-    try:
-        args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
-    except Exception:
-        args = {}
+    args = _parse_tool_arguments(payload.get("arguments"))
 
-    explanation = str(args.get("explanation", "")).strip()
+    explanation = _clean_optional_text(args.get("explanation"))
     plan = args.get("plan")
     if not isinstance(plan, list) or not plan:
         if explanation:
@@ -252,8 +334,8 @@ def build_update_plan_text(payload: dict) -> str:
     for idx, item in enumerate(plan[:max_steps], 1):
         if not isinstance(item, dict):
             continue
-        status = str(item.get("status", "pending")).strip().lower() or "pending"
-        step = _short(str(item.get("step", "")).strip(), 220)
+        status = _clean_optional_text(item.get("status") or "pending").lower() or "pending"
+        step = _short(_clean_optional_text(item.get("step")), 220)
         if status not in counts:
             counts[status] = 0
         counts[status] += 1
@@ -265,7 +347,7 @@ def build_update_plan_text(payload: dict) -> str:
     for item in plan[max_steps:]:
         if not isinstance(item, dict):
             continue
-        status = str(item.get("status", "pending")).strip().lower() or "pending"
+        status = _clean_optional_text(item.get("status") or "pending").lower() or "pending"
         if status not in counts:
             counts[status] = 0
         counts[status] += 1
@@ -278,6 +360,35 @@ def build_update_plan_text(payload: dict) -> str:
         f"in_progress={counts.get('in_progress', 0)}, pending={counts.get('pending', 0)}"
     )
     return "\n".join(lines).strip()
+
+
+def is_assistant_plan_text(message: str) -> bool:
+    text = _clean_optional_text(message)
+    if not text:
+        return False
+
+    lowered = text.lower()
+    markers = (
+        "<proposed_plan>",
+        "implement this plan?",
+        "acceptance criteria",
+        "failure modes",
+        "test cases",
+        "public api / interface",
+        "expand plan",
+    )
+    if any(marker in lowered for marker in markers):
+        return True
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    first = lines[0].lower()
+    if first in {"plan", "plan:", "mock plan"}:
+        return True
+    if first.startswith("plan ") and len(lines) >= 3:
+        return True
+    return False
 
 
 def read_new_lines(file_path: Path, offset: int):
@@ -302,6 +413,7 @@ def process_file(
     task_reply_mode: str,
     notify_request_user_input: bool,
     notify_plan_updates: bool,
+    notify_assistant_plan_text: bool,
 ) -> None:
     key = str(file_path)
     file_size = file_path.stat().st_size
@@ -313,8 +425,13 @@ def process_file(
         state[key].offset = 0
     if not state[key].topic:
         state[key].topic = detect_topic_from_file(file_path) or file_path.stem
+    if not state[key].cwd:
+        state[key].cwd = detect_cwd_from_file(file_path)
 
     current_offset = state[key].offset
+    current_turn_id = ""
+    final_answer_by_turn: Dict[str, str] = {}
+    last_final_answer_text = ""
 
     with file_path.open("r", encoding="utf-8", errors="replace") as handle:
         handle.seek(current_offset)
@@ -329,6 +446,13 @@ def process_file(
                 continue
 
             row_type = str(row.get("type", ""))
+            if row_type == "turn_context":
+                context = row.get("payload", {})
+                current_turn_id = _clean_optional_text(context.get("turn_id"))
+                turn_cwd = _clean_optional_text(context.get("cwd"))
+                if turn_cwd:
+                    state[key].cwd = turn_cwd
+                continue
             if row_type not in {"event_msg", "response_item"}:
                 continue
 
@@ -336,6 +460,33 @@ def process_file(
             timestamp = str(row.get("timestamp", "unknown"))
             session_name = file_path.stem
             topic = state[key].topic or session_name
+            cwd = state[key].cwd
+
+            if row_type == "response_item":
+                if payload.get("type") == "message" and payload.get("role") == "assistant":
+                    if _clean_optional_text(payload.get("phase")) == "final_answer":
+                        text = _extract_message_text(payload.get("content"))
+                        if text:
+                            last_final_answer_text = text
+                            if current_turn_id:
+                                final_answer_by_turn[current_turn_id] = text
+                            if notify_assistant_plan_text and is_assistant_plan_text(text):
+                                if task_reply_mode == "full":
+                                    plan_reply_text = text
+                                else:
+                                    plan_reply_text = truncate_preview(text, max_preview_chars)
+                                state[key].last_plan_turn_id = current_turn_id
+                                state[key].last_plan_reply_norm = _normalize_for_dedupe(plan_reply_text)
+                                state[key].last_plan_sent_at = time.time()
+                                alert = (
+                                    "[Codex Assistant Plan]\n"
+                                    f"session: {session_name}\n"
+                                    f"cwd: {cwd}\n"
+                                    f"topic: {topic}\n"
+                                    f"time: {timestamp}\n"
+                                    f"reply: {plan_reply_text}"
+                                )
+                                send_notification(sender_script, alert)
 
             if row_type == "event_msg":
                 payload_type = str(payload.get("type", ""))
@@ -344,12 +495,20 @@ def process_file(
                 if notify_event == "agent_message":
                     if payload_type != "agent_message":
                         continue
-                    message = str(payload.get("message", "")).strip()
+                    message = _clean_optional_text(payload.get("message"))
                 else:
                     # Default behavior: one notification when a turn completes.
                     if payload_type != "task_complete":
                         continue
-                    message = str(payload.get("last_agent_message", "")).strip()
+                    message = _clean_optional_text(payload.get("last_agent_message"))
+                    if not message:
+                        turn_id = _clean_optional_text(payload.get("turn_id"))
+                        if turn_id and turn_id in final_answer_by_turn:
+                            message = final_answer_by_turn[turn_id]
+                        elif current_turn_id and current_turn_id in final_answer_by_turn:
+                            message = final_answer_by_turn[current_turn_id]
+                        elif last_final_answer_text:
+                            message = last_final_answer_text
 
                 if not message:
                     continue
@@ -359,9 +518,20 @@ def process_file(
                 else:
                     reply_text = truncate_preview(message, max_preview_chars)
 
+                # Dedupe plan-mode double notification:
+                # if assistant plan text was just sent with same content, skip the task_complete copy.
+                turn_id = _clean_optional_text(payload.get("turn_id"))
+                reply_norm = _normalize_for_dedupe(reply_text)
+                same_reply = bool(reply_norm) and reply_norm == state[key].last_plan_reply_norm
+                same_turn = bool(turn_id) and turn_id == state[key].last_plan_turn_id
+                recent_plan = (time.time() - state[key].last_plan_sent_at) <= 30.0
+                if same_reply and (same_turn or recent_plan):
+                    continue
+
                 alert = (
                     "[Codex Task Complete]\n"
                     f"session: {session_name}\n"
+                    f"cwd: {cwd}\n"
                     f"topic: {topic}\n"
                     f"time: {timestamp}\n"
                     f"reply: {reply_text}"
@@ -376,6 +546,7 @@ def process_file(
                     alert = (
                         "[Codex Action Required]\n"
                         f"session: {session_name}\n"
+                        f"cwd: {cwd}\n"
                         f"topic: {topic}\n"
                         f"time: {timestamp}\n"
                         f"question: {action_text}"
@@ -388,6 +559,7 @@ def process_file(
                     alert = (
                         "[Codex Plan Updated]\n"
                         f"session: {session_name}\n"
+                        f"cwd: {cwd}\n"
                         f"topic: {topic}\n"
                         f"time: {timestamp}\n"
                         f"plan: {plan_text}"
@@ -445,6 +617,11 @@ def main() -> int:
         help="Send notifications when Codex updates plan steps (update_plan). true|false",
     )
     parser.add_argument(
+        "--notify-assistant-plan-text",
+        default=os.environ.get("TELEGRAM_NOTIFY_ASSISTANT_PLAN_TEXT", "true"),
+        help="Send notifications for assistant plan proposal text. true|false",
+    )
+    parser.add_argument(
         "--sender-script",
         default=str(Path(__file__).resolve().parent / "telegram_notify.sh"),
         help="Script used to send notifications.",
@@ -489,6 +666,7 @@ def main() -> int:
                     task_reply_mode=args.task_reply_mode,
                     notify_request_user_input=_parse_bool(args.notify_request_user_input, default=True),
                     notify_plan_updates=_parse_bool(args.notify_plan_updates, default=True),
+                    notify_assistant_plan_text=_parse_bool(args.notify_assistant_plan_text, default=True),
                 )
 
             cleanup_removed_files(state, existing)

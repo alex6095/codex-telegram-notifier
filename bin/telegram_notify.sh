@@ -60,25 +60,79 @@ format_timestamp_for_display() {
   fi
 }
 
+sanitize_reply_text() {
+  local input="$1"
+  python3 - "$input" <<'PY'
+import sys
+
+text = sys.argv[1].replace("\r\n", "\n")
+lines = text.split("\n")
+
+nonempty = [idx for idx, line in enumerate(lines) if line.strip()]
+if nonempty:
+    first_idx = nonempty[0]
+    last_idx = nonempty[-1]
+    first = lines[first_idx].strip()
+    last = lines[last_idx].strip()
+    if first == "<proposed_plan>" and last == "</proposed_plan>":
+        lines = lines[first_idx + 1:last_idx]
+        while lines and not lines[0].strip():
+            lines = lines[1:]
+        while lines and not lines[-1].strip():
+            lines = lines[:-1]
+        text = "\n".join(lines)
+
+sys.stdout.write(text)
+PY
+}
+
+format_reply_html_block() {
+  local reply_text="$1"
+  local cleaned reply_mode rendered
+
+  cleaned="$(sanitize_reply_text "$reply_text")"
+  if [[ -z "$cleaned" ]]; then
+    cleaned="<empty>"
+  fi
+
+  reply_mode="$(resolve_reply_mode)"
+  if [[ "$reply_mode" == "HTML_MARKDOWN" ]]; then
+    rendered="$(markdown_to_html "$cleaned")"
+    if [[ -z "${rendered// }" ]]; then
+      printf '<pre>%s</pre>' "$(printf '%s' "$cleaned" | escape_html)"
+    else
+      printf '%s' "$rendered"
+    fi
+    return 0
+  fi
+
+  printf '<pre>%s</pre>' "$(printf '%s' "$cleaned" | escape_html)"
+}
+
 format_html_message() {
   local raw="$1"
   local first_line
   first_line="$(printf '%s\n' "$raw" | head -n 1)"
 
   if [[ "$first_line" =~ ^\[Codex\ (Turn|Task)\ Complete\]$ ]]; then
-    local session topic timestamp reply_block id_mode
+    local session cwd topic timestamp reply_block id_mode
     session="$(printf '%s\n' "$raw" | sed -n 's/^session: //p' | head -n 1)"
+    cwd="$(printf '%s\n' "$raw" | sed -n 's/^cwd: //p' | head -n 1)"
     topic="$(printf '%s\n' "$raw" | sed -n 's/^topic: //p' | head -n 1)"
     timestamp="$(printf '%s\n' "$raw" | sed -n 's/^time: //p' | head -n 1)"
     timestamp="$(format_timestamp_for_display "$timestamp")"
     reply_block="$(printf '%s\n' "$raw" | sed -n '/^reply: /,$p')"
     reply_block="${reply_block#reply: }"
+    reply_block="$(sanitize_reply_text "$reply_block")"
     if [[ -z "$reply_block" ]]; then
       reply_block="<empty>"
     fi
     id_mode="${TELEGRAM_TURN_ID_MODE,,}"
 
     printf '<b>Codex %s Complete</b>\n' "$(escape_inline "${BASH_REMATCH[1]}")"
+    if [[ -n "$cwd" ]]; then
+      printf '<b>CWD</b>: <code>%s</code>\n' "$(escape_inline "$cwd")"
+    fi
     if [[ "$id_mode" == "topic" ]]; then
       if [[ -n "$topic" ]]; then
         printf '<b>Topic</b>: <code>%s</code>\n' "$(escape_inline "$topic")"
@@ -94,13 +148,50 @@ format_html_message() {
       printf '<b>Session</b>: <code>%s</code>\n' "$(escape_inline "$session")"
     fi
     printf '<b>Time</b>: <code>%s</code>\n' "$(escape_inline "$timestamp")"
-    printf '<b>Reply</b>\n<pre>%s</pre>' "$(printf '%s' "$reply_block" | escape_html)"
+    printf '<b>Reply</b>\n%s' "$(format_reply_html_block "$reply_block")"
+    return 0
+  fi
+
+  if [[ "$first_line" == "[Codex Assistant Plan]" ]]; then
+    local session cwd topic timestamp reply_block id_mode
+    session="$(printf '%s\n' "$raw" | sed -n 's/^session: //p' | head -n 1)"
+    cwd="$(printf '%s\n' "$raw" | sed -n 's/^cwd: //p' | head -n 1)"
+    topic="$(printf '%s\n' "$raw" | sed -n 's/^topic: //p' | head -n 1)"
+    timestamp="$(printf '%s\n' "$raw" | sed -n 's/^time: //p' | head -n 1)"
+    timestamp="$(format_timestamp_for_display "$timestamp")"
+    reply_block="$(printf '%s\n' "$raw" | sed -n '/^reply: /,$p')"
+    reply_block="${reply_block#reply: }"
+    reply_block="$(sanitize_reply_text "$reply_block")"
+    [[ -z "$reply_block" ]] && reply_block="<empty>"
+    id_mode="${TELEGRAM_TURN_ID_MODE,,}"
+
+    printf '<b>Codex Assistant Plan</b>\n'
+    if [[ -n "$cwd" ]]; then
+      printf '<b>CWD</b>: <code>%s</code>\n' "$(escape_inline "$cwd")"
+    fi
+    if [[ "$id_mode" == "topic" ]]; then
+      if [[ -n "$topic" ]]; then
+        printf '<b>Topic</b>: <code>%s</code>\n' "$(escape_inline "$topic")"
+      else
+        printf '<b>Session</b>: <code>%s</code>\n' "$(escape_inline "$session")"
+      fi
+    elif [[ "$id_mode" == "session" ]]; then
+      printf '<b>Session</b>: <code>%s</code>\n' "$(escape_inline "$session")"
+    else
+      if [[ -n "$topic" ]]; then
+        printf '<b>Topic</b>: <code>%s</code>\n' "$(escape_inline "$topic")"
+      fi
+      printf '<b>Session</b>: <code>%s</code>\n' "$(escape_inline "$session")"
+    fi
+    printf '<b>Time</b>: <code>%s</code>\n' "$(escape_inline "$timestamp")"
+    printf '<b>Reply</b>\n%s' "$(format_reply_html_block "$reply_block")"
     return 0
   fi
 
   if [[ "$first_line" == "[Codex Action Required]" ]]; then
-    local session topic timestamp question_block id_mode
+    local session cwd topic timestamp question_block id_mode
     session="$(printf '%s\n' "$raw" | sed -n 's/^session: //p' | head -n 1)"
+    cwd="$(printf '%s\n' "$raw" | sed -n 's/^cwd: //p' | head -n 1)"
     topic="$(printf '%s\n' "$raw" | sed -n 's/^topic: //p' | head -n 1)"
     timestamp="$(printf '%s\n' "$raw" | sed -n 's/^time: //p' | head -n 1)"
     timestamp="$(format_timestamp_for_display "$timestamp")"
@@ -110,6 +201,9 @@ format_html_message() {
     id_mode="${TELEGRAM_TURN_ID_MODE,,}"
 
     printf '<b>Codex Action Required</b>\n'
+    if [[ -n "$cwd" ]]; then
+      printf '<b>CWD</b>: <code>%s</code>\n' "$(escape_inline "$cwd")"
+    fi
     if [[ "$id_mode" == "topic" ]]; then
       if [[ -n "$topic" ]]; then
         printf '<b>Topic</b>: <code>%s</code>\n' "$(escape_inline "$topic")"
@@ -130,8 +224,9 @@ format_html_message() {
   fi
 
   if [[ "$first_line" == "[Codex Plan Updated]" ]]; then
-    local session topic timestamp plan_block id_mode
+    local session cwd topic timestamp plan_block id_mode
     session="$(printf '%s\n' "$raw" | sed -n 's/^session: //p' | head -n 1)"
+    cwd="$(printf '%s\n' "$raw" | sed -n 's/^cwd: //p' | head -n 1)"
     topic="$(printf '%s\n' "$raw" | sed -n 's/^topic: //p' | head -n 1)"
     timestamp="$(printf '%s\n' "$raw" | sed -n 's/^time: //p' | head -n 1)"
     timestamp="$(format_timestamp_for_display "$timestamp")"
@@ -141,6 +236,9 @@ format_html_message() {
     id_mode="${TELEGRAM_TURN_ID_MODE,,}"
 
     printf '<b>Codex Plan Updated</b>\n'
+    if [[ -n "$cwd" ]]; then
+      printf '<b>CWD</b>: <code>%s</code>\n' "$(escape_inline "$cwd")"
+    fi
     if [[ "$id_mode" == "topic" ]]; then
       if [[ -n "$topic" ]]; then
         printf '<b>Topic</b>: <code>%s</code>\n' "$(escape_inline "$topic")"
@@ -211,18 +309,59 @@ format_markdown_v2_message() {
   first_line="$(printf '%s\n' "$raw" | head -n 1)"
 
   if [[ "$first_line" =~ ^\[Codex\ (Turn|Task)\ Complete\]$ ]]; then
-    local kind session topic timestamp reply_block id_mode
+    local kind session cwd topic timestamp reply_block id_mode
     kind="${BASH_REMATCH[1]}"
     session="$(printf '%s\n' "$raw" | sed -n 's/^session: //p' | head -n 1)"
+    cwd="$(printf '%s\n' "$raw" | sed -n 's/^cwd: //p' | head -n 1)"
     topic="$(printf '%s\n' "$raw" | sed -n 's/^topic: //p' | head -n 1)"
     timestamp="$(printf '%s\n' "$raw" | sed -n 's/^time: //p' | head -n 1)"
     timestamp="$(format_timestamp_for_display "$timestamp")"
     reply_block="$(printf '%s\n' "$raw" | sed -n '/^reply: /,$p')"
     reply_block="${reply_block#reply: }"
+    reply_block="$(sanitize_reply_text "$reply_block")"
     [[ -z "$reply_block" ]] && reply_block="<empty>"
     id_mode="${TELEGRAM_TURN_ID_MODE,,}"
 
     printf '*Codex %s Complete*\n' "$(printf '%s' "$kind" | escape_markdown_v2)"
+    if [[ -n "$cwd" ]]; then
+      printf '*CWD*: %s\n' "$(printf '%s' "$cwd" | escape_markdown_v2)"
+    fi
+    if [[ "$id_mode" == "topic" ]]; then
+      if [[ -n "$topic" ]]; then
+        printf '*Topic*: %s\n' "$(printf '%s' "$topic" | escape_markdown_v2)"
+      else
+        printf '*Session*: %s\n' "$(printf '%s' "$session" | escape_markdown_v2)"
+      fi
+    elif [[ "$id_mode" == "session" ]]; then
+      printf '*Session*: %s\n' "$(printf '%s' "$session" | escape_markdown_v2)"
+    else
+      if [[ -n "$topic" ]]; then
+        printf '*Topic*: %s\n' "$(printf '%s' "$topic" | escape_markdown_v2)"
+      fi
+      printf '*Session*: %s\n' "$(printf '%s' "$session" | escape_markdown_v2)"
+    fi
+    printf '*Time*: %s\n' "$(printf '%s' "$timestamp" | escape_markdown_v2)"
+    printf '*Reply*\n%s' "$(printf '%s' "$reply_block" | escape_markdown_v2)"
+    return 0
+  fi
+
+  if [[ "$first_line" == "[Codex Assistant Plan]" ]]; then
+    local session cwd topic timestamp reply_block id_mode
+    session="$(printf '%s\n' "$raw" | sed -n 's/^session: //p' | head -n 1)"
+    cwd="$(printf '%s\n' "$raw" | sed -n 's/^cwd: //p' | head -n 1)"
+    topic="$(printf '%s\n' "$raw" | sed -n 's/^topic: //p' | head -n 1)"
+    timestamp="$(printf '%s\n' "$raw" | sed -n 's/^time: //p' | head -n 1)"
+    timestamp="$(format_timestamp_for_display "$timestamp")"
+    reply_block="$(printf '%s\n' "$raw" | sed -n '/^reply: /,$p')"
+    reply_block="${reply_block#reply: }"
+    reply_block="$(sanitize_reply_text "$reply_block")"
+    [[ -z "$reply_block" ]] && reply_block="<empty>"
+    id_mode="${TELEGRAM_TURN_ID_MODE,,}"
+
+    printf '*Codex Assistant Plan*\n'
+    if [[ -n "$cwd" ]]; then
+      printf '*CWD*: %s\n' "$(printf '%s' "$cwd" | escape_markdown_v2)"
+    fi
     if [[ "$id_mode" == "topic" ]]; then
       if [[ -n "$topic" ]]; then
         printf '*Topic*: %s\n' "$(printf '%s' "$topic" | escape_markdown_v2)"
@@ -243,8 +382,9 @@ format_markdown_v2_message() {
   fi
 
   if [[ "$first_line" == "[Codex Action Required]" ]]; then
-    local session topic timestamp question_block id_mode
+    local session cwd topic timestamp question_block id_mode
     session="$(printf '%s\n' "$raw" | sed -n 's/^session: //p' | head -n 1)"
+    cwd="$(printf '%s\n' "$raw" | sed -n 's/^cwd: //p' | head -n 1)"
     topic="$(printf '%s\n' "$raw" | sed -n 's/^topic: //p' | head -n 1)"
     timestamp="$(printf '%s\n' "$raw" | sed -n 's/^time: //p' | head -n 1)"
     timestamp="$(format_timestamp_for_display "$timestamp")"
@@ -254,6 +394,9 @@ format_markdown_v2_message() {
     id_mode="${TELEGRAM_TURN_ID_MODE,,}"
 
     printf '*Codex Action Required*\n'
+    if [[ -n "$cwd" ]]; then
+      printf '*CWD*: %s\n' "$(printf '%s' "$cwd" | escape_markdown_v2)"
+    fi
     if [[ "$id_mode" == "topic" ]]; then
       if [[ -n "$topic" ]]; then
         printf '*Topic*: %s\n' "$(printf '%s' "$topic" | escape_markdown_v2)"
@@ -274,8 +417,9 @@ format_markdown_v2_message() {
   fi
 
   if [[ "$first_line" == "[Codex Plan Updated]" ]]; then
-    local session topic timestamp plan_block id_mode
+    local session cwd topic timestamp plan_block id_mode
     session="$(printf '%s\n' "$raw" | sed -n 's/^session: //p' | head -n 1)"
+    cwd="$(printf '%s\n' "$raw" | sed -n 's/^cwd: //p' | head -n 1)"
     topic="$(printf '%s\n' "$raw" | sed -n 's/^topic: //p' | head -n 1)"
     timestamp="$(printf '%s\n' "$raw" | sed -n 's/^time: //p' | head -n 1)"
     timestamp="$(format_timestamp_for_display "$timestamp")"
@@ -285,6 +429,9 @@ format_markdown_v2_message() {
     id_mode="${TELEGRAM_TURN_ID_MODE,,}"
 
     printf '*Codex Plan Updated*\n'
+    if [[ -n "$cwd" ]]; then
+      printf '*CWD*: %s\n' "$(printf '%s' "$cwd" | escape_markdown_v2)"
+    fi
     if [[ "$id_mode" == "topic" ]]; then
       if [[ -n "$topic" ]]; then
         printf '*Topic*: %s\n' "$(printf '%s' "$topic" | escape_markdown_v2)"
@@ -503,8 +650,7 @@ PY
 send_task_complete_message() {
   local raw="$1"
   local mode="$2"
-  local first_line kind session topic timestamp reply_block header_source header_formatted
-  local reply_mode chunk_chars
+  local first_line kind session cwd topic timestamp reply_block body_source body_formatted
 
   first_line="$(printf '%s\n' "$raw" | head -n 1)"
   if [[ ! "$first_line" =~ ^\[Codex\ (Turn|Task)\ Complete\]$ ]]; then
@@ -513,57 +659,54 @@ send_task_complete_message() {
 
   kind="${BASH_REMATCH[1]}"
   session="$(printf '%s\n' "$raw" | sed -n 's/^session: //p' | head -n 1)"
+  cwd="$(printf '%s\n' "$raw" | sed -n 's/^cwd: //p' | head -n 1)"
   topic="$(printf '%s\n' "$raw" | sed -n 's/^topic: //p' | head -n 1)"
   timestamp="$(printf '%s\n' "$raw" | sed -n 's/^time: //p' | head -n 1)"
   timestamp="$(format_timestamp_for_display "$timestamp")"
   reply_block="$(printf '%s\n' "$raw" | sed -n '/^reply: /,$p')"
   reply_block="${reply_block#reply: }"
+  reply_block="$(sanitize_reply_text "$reply_block")"
   [[ -z "$reply_block" ]] && reply_block="<empty>"
 
-  header_source="[Codex ${kind} Complete]"$'\n'
-  header_source+="session: ${session}"$'\n'
-  if [[ -n "$topic" ]]; then
-    header_source+="topic: ${topic}"$'\n'
+  body_source="[Codex ${kind} Complete]"$'\n'
+  body_source+="session: ${session}"$'\n'
+  if [[ -n "$cwd" ]]; then
+    body_source+="cwd: ${cwd}"$'\n'
   fi
-  header_source+="time: ${timestamp}"$'\n'
+  if [[ -n "$topic" ]]; then
+    body_source+="topic: ${topic}"$'\n'
+  fi
+  body_source+="time: ${timestamp}"$'\n'
   if is_truthy "$TELEGRAM_FULL_REPLY"; then
-    header_source+="reply: (full reply follows below)"
+    body_source+="reply: ${reply_block}"
   else
     if (( ${#reply_block} > 700 )); then
-      header_source+="reply: ${reply_block:0:700}..."
+      body_source+="reply: ${reply_block:0:700}..."
     else
-      header_source+="reply: ${reply_block}"
+      body_source+="reply: ${reply_block}"
     fi
   fi
 
   case "${mode^^}" in
     HTML)
-      header_formatted="$(format_html_message "$header_source")"
+      body_formatted="$(format_html_message "$body_source")"
       ;;
     MARKDOWNV2)
-      header_formatted="$(format_markdown_v2_message "$header_source")"
+      body_formatted="$(format_markdown_v2_message "$body_source")"
       ;;
     *)
-      header_formatted="$header_source"
+      body_formatted="$body_source"
       ;;
   esac
 
-  if (( ${#header_formatted} > 3900 )); then
-    header_formatted="${header_formatted:0:3900}..."
+  if (( ${#body_formatted} > 3900 )); then
+    body_formatted="${body_formatted:0:3900}..."
   fi
-  if (( ${#header_source} > 3900 )); then
-    header_source="${header_source:0:3900}..."
-  fi
-
-  send_with_fallback "$mode" "$header_formatted" "$header_source"
-
-  if ! is_truthy "$TELEGRAM_FULL_REPLY"; then
-    return 0
+  if (( ${#body_source} > 3900 )); then
+    body_source="${body_source:0:3900}..."
   fi
 
-  reply_mode="$(resolve_reply_mode)"
-  chunk_chars="$(normalize_reply_chunk_chars)"
-  send_reply_chunks "$reply_block" "$reply_mode" "$chunk_chars"
+  send_with_fallback "$mode" "$body_formatted" "$body_source"
 }
 
 MODE="${TELEGRAM_PARSE_MODE}"

@@ -72,7 +72,10 @@ Watcher runs as a background daemon (`nohup` + `setsid`), so you do not need to 
 - Set `TELEGRAM_NOTIFY_EVENT=agent_message` only if you want chatty intermediate notifications.
 - Set `TELEGRAM_NOTIFY_REQUEST_USER_INPUT=true` to get alerts when Codex asks a question in Plan mode.
 - Set `TELEGRAM_NOTIFY_PLAN_UPDATES=true` to get alerts when Codex updates plan steps (`update_plan`).
+- Set `TELEGRAM_NOTIFY_ASSISTANT_PLAN_TEXT=true` to get alerts for assistant plan proposal text (for example `<proposed_plan>` blocks).
+- If `task_complete.last_agent_message` is missing (`null`) in Plan mode, watcher falls back to the same turn's `assistant final_answer` text (for example `<proposed_plan>`), so it no longer sends `None`.
 - Session watcher message format includes session id, inferred topic, timestamp, and reply body.
+- Session watcher message now includes `cwd` (shown above topic in Telegram).
 - `TELEGRAM_TASK_REPLY_MODE=full|preview` controls what watcher forwards for `task_complete`:
   - `full` (default): forward raw `last_agent_message` (keeps markdown/newlines)
   - `preview`: send compact single-line preview
@@ -80,11 +83,11 @@ Watcher runs as a background daemon (`nohup` + `setsid`), so you do not need to 
 - Topic source is the first `user_message` found in that session file. (Codex UI session title is not currently present in session jsonl payload.)
 - Watcher scans all files under `~/.codex/sessions`, but notifications are sent only when new matching events are appended.
 - By default, messages are sent with Telegram `HTML` parse mode for rich formatting. You can change this with `TELEGRAM_PARSE_MODE` in `.env` (example: `MarkdownV2` or empty/plain text).
-- For task-complete notifications, the full reply can be sent in chunked messages:
-  - `TELEGRAM_FULL_REPLY=true|false` (default `true`)
-  - `TELEGRAM_REPLY_PARSE_MODE=auto|HTML|MarkdownV2|Markdown|plain` (default `auto`, markdown-like reply is converted to Telegram HTML)
-  - `TELEGRAM_REPLY_CHUNK_CHARS=3500` (clamped to `200..3900`)
-  - `TELEGRAM_TIMEZONE=Asia/Seoul` (default `Asia/Seoul`, used for displayed task time)
+- For task-complete notifications, `TELEGRAM_FULL_REPLY=true|false` (default `true`) controls whether full reply is included.
+- Full reply is sent as a single Telegram message (not split). If too long, it is truncated to fit Telegram limits.
+- `TELEGRAM_REPLY_PARSE_MODE=auto|plain` (default `auto`): `auto` renders markdown-like reply text in Telegram HTML.
+- `<proposed_plan>...</proposed_plan>` wrapper tags are stripped in reply display.
+- `TELEGRAM_TIMEZONE=Asia/Seoul` (default `Asia/Seoul`) controls displayed time.
 - If formatted sending fails for any reason, the notifier retries as plain text so alerts are not dropped.
 - Use `TELEGRAM_TURN_ID_MODE` in `.env`:
   - `both` (default): show topic + session
